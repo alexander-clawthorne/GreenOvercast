@@ -4,6 +4,16 @@ const settings = @import("persistent_settings.zig");
 // Second line of every generated script; only files carrying it are ever replaced or removed.
 pub const marker = "# GreenOvercast game shortcut";
 pub const name_capacity = 64;
+/// Longest launcher path writeScript accepts; keeps every script within what state() reads.
+pub const max_launcher_length = 512;
+
+const script_read_capacity = 1024;
+const max_script_length = ("#!/bin/bash\n" ++ marker ++ "\n").len + "# \n".len + name_capacity +
+    "export GREENOVERCAST_SERVICE=geforce-now\n".len + "export GREENOVERCAST_AUTOSTART=1\n".len +
+    "exec /bin/bash '' ''\n".len + max_launcher_length + settings.product_id_capacity;
+comptime {
+    std.debug.assert(max_script_length < script_read_capacity);
+}
 
 pub const Service = enum {
     xbox,
@@ -62,7 +72,7 @@ pub fn portName(buffer: *[name_capacity]u8, title: []const u8) []const u8 {
 }
 
 pub fn writeScript(writer: anytype, shortcut: Shortcut, name: []const u8) !void {
-    if (!std.fs.path.isAbsolute(shortcut.launcher) or
+    if (!std.fs.path.isAbsolute(shortcut.launcher) or shortcut.launcher.len > max_launcher_length or
         std.mem.indexOfAny(u8, shortcut.launcher, "'\n\r") != null) return error.InvalidLauncher;
     if (!settings.validProductId(shortcut.product_id)) return error.InvalidProductId;
     if (name.len == 0 or std.mem.indexOfAny(u8, name, "\n\r") != null) return error.InvalidName;
@@ -82,7 +92,7 @@ pub fn state(directory: std.fs.Dir, script_name: []const u8, product_id: []const
         else => .foreign,
     };
     defer file.close();
-    var buffer: [1024]u8 = undefined;
+    var buffer: [script_read_capacity]u8 = undefined;
     const length = file.readAll(&buffer) catch return .foreign;
     if (length == buffer.len) return .foreign;
     const content = buffer[0..length];
@@ -243,4 +253,24 @@ test "a shortcut for another title with the same port name is left alone" {
     try std.testing.expectError(error.NameInUse, add(ports.dir, null, second, "A B", null));
     try std.testing.expectError(error.NotAShortcut, remove(ports.dir, null, "A B", second.product_id));
     try std.testing.expectEqual(State.shortcut, state(ports.dir, "A B.sh", first.product_id));
+}
+
+test "the longest accepted shortcut can still be recognised and removed" {
+    var ports = std.testing.tmpDir(.{});
+    defer ports.cleanup();
+    const launcher = "/" ++ "p" ** (max_launcher_length - 1);
+    const product_id = "x" ** (settings.product_id_capacity - 1);
+    const name = "N" ** name_capacity;
+    const longest = Shortcut{ .launcher = launcher, .service = .geforce_now, .product_id = product_id };
+
+    try add(ports.dir, null, longest, name, null);
+    try std.testing.expectEqual(State.shortcut, state(ports.dir, name ++ ".sh", product_id));
+    try remove(ports.dir, null, name, product_id);
+    try std.testing.expectEqual(State.absent, state(ports.dir, name ++ ".sh", product_id));
+
+    var too_long = longest;
+    too_long.launcher = launcher ++ "p";
+    var output = std.ArrayList(u8).init(std.testing.allocator);
+    defer output.deinit();
+    try std.testing.expectError(error.InvalidLauncher, writeScript(output.writer(), too_long, "N"));
 }
