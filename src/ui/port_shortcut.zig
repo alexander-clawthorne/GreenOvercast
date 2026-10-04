@@ -74,18 +74,25 @@ pub fn writeScript(writer: anytype, shortcut: Shortcut, name: []const u8) !void 
     try writer.print("exec /bin/bash '{s}' '{s}'\n", .{ shortcut.launcher, shortcut.product_id });
 }
 
-pub fn state(directory: std.fs.Dir, script_name: []const u8) State {
+/// `.shortcut` only for a generated script that launches this product. Different titles
+/// can share a port name, so a marked script for another product counts as foreign.
+pub fn state(directory: std.fs.Dir, script_name: []const u8, product_id: []const u8) State {
     const file = directory.openFile(script_name, .{}) catch |err| return switch (err) {
         error.FileNotFound => .absent,
         else => .foreign,
     };
     defer file.close();
-    var buffer: [96]u8 = undefined;
+    var buffer: [1024]u8 = undefined;
     const length = file.readAll(&buffer) catch return .foreign;
-    var lines = std.mem.splitScalar(u8, buffer[0..length], '\n');
+    if (length == buffer.len) return .foreign;
+    const content = buffer[0..length];
+    var lines = std.mem.splitScalar(u8, content, '\n');
     _ = lines.next();
     const second = lines.next() orelse return .foreign;
-    return if (std.mem.eql(u8, second, marker)) .shortcut else .foreign;
+    if (!std.mem.eql(u8, second, marker)) return .foreign;
+    var ending_buffer: [settings.product_id_capacity + 8]u8 = undefined;
+    const ending = std.fmt.bufPrint(&ending_buffer, " '{s}'\n", .{product_id}) catch return .foreign;
+    return if (std.mem.endsWith(u8, content, ending)) .shortcut else .foreign;
 }
 
 pub fn add(
@@ -97,7 +104,7 @@ pub fn add(
 ) !void {
     var script_buffer: [name_capacity + 8]u8 = undefined;
     const script_name = try std.fmt.bufPrint(&script_buffer, "{s}.sh", .{name});
-    if (state(ports, script_name) == .foreign) return error.NameInUse;
+    if (state(ports, script_name, shortcut.product_id) == .foreign) return error.NameInUse;
 
     var content = std.ArrayList(u8).init(std.heap.page_allocator);
     defer content.deinit();
@@ -112,34 +119,33 @@ pub fn add(
         std.debug.print("Shortcut artwork could not be saved: {s}\n", .{@errorName(err)});
 }
 
-pub fn remove(ports: std.fs.Dir, artwork: ?std.fs.Dir, name: []const u8) !void {
+pub fn remove(ports: std.fs.Dir, artwork: ?std.fs.Dir, name: []const u8, product_id: []const u8) !void {
     var script_buffer: [name_capacity + 8]u8 = undefined;
     const script_name = try std.fmt.bufPrint(&script_buffer, "{s}.sh", .{name});
-    if (state(ports, script_name) != .shortcut) return error.NotAShortcut;
+    if (state(ports, script_name, product_id) != .shortcut) return error.NotAShortcut;
+    // Artwork first and best-effort, so the script is removed last and any error reported
+    // matches what is still on disk.
+    if (artwork) |directory| {
+        var cover_buffer: [name_capacity + 8]u8 = undefined;
+        const cover_name = try std.fmt.bufPrint(&cover_buffer, "{s}.png", .{name});
+        directory.deleteFile(cover_name) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => std.debug.print("Shortcut artwork could not be removed: {s}\n", .{@errorName(err)}),
+        };
+    }
     try ports.deleteFile(script_name);
-    const directory = artwork orelse return;
-    var cover_buffer: [name_capacity + 8]u8 = undefined;
-    const cover_name = try std.fmt.bufPrint(&cover_buffer, "{s}.png", .{name});
-    directory.deleteFile(cover_name) catch |err| switch (err) {
-        error.FileNotFound => {},
-        else => return err,
-    };
 }
 
 fn writeAtomic(directory: std.fs.Dir, name: []const u8, data: []const u8, mode: std.fs.File.Mode) !void {
-    var temporary_buffer: [name_capacity + 16]u8 = undefined;
-    const temporary = try std.fmt.bufPrint(&temporary_buffer, "{s}.tmp", .{name});
-    errdefer directory.deleteFile(temporary) catch {};
-    var file = try directory.createFile(temporary, .{ .truncate = true });
-    var closed = false;
-    defer if (!closed) file.close();
-    try file.writeAll(data);
+    // AtomicFile creates a randomly named temporary exclusively, so nothing else in the
+    // shared Ports folder can be overwritten before the final rename.
+    var file = try directory.atomicFile(name, .{ .mode = mode });
+    defer file.deinit();
+    try file.file.writeAll(data);
     // The port launcher runs under umask 077; frontends need to read and run shortcuts.
-    try file.chmod(mode);
-    try file.sync();
-    file.close();
-    closed = true;
-    try directory.rename(temporary, name);
+    try file.file.chmod(mode);
+    try file.file.sync();
+    try file.finish();
 }
 
 test "port names keep readable titles and drop unsafe characters" {
@@ -200,19 +206,41 @@ test "shortcuts are added and removed without touching other ports" {
         .product_id = "9NBLGGH4R315",
     };
 
+    const product = shortcut.product_id;
+
     try add(ports.dir, artwork.dir, shortcut, "Halo", "png-bytes");
-    try std.testing.expectEqual(State.shortcut, state(ports.dir, "Halo.sh"));
+    try std.testing.expectEqual(State.shortcut, state(ports.dir, "Halo.sh", product));
     const stat = try ports.dir.statFile("Halo.sh");
     try std.testing.expectEqual(@as(std.fs.File.Mode, 0o755), stat.mode & 0o777);
     var cover_buffer: [16]u8 = undefined;
     try std.testing.expectEqualStrings("png-bytes", try artwork.dir.readFile("Halo.png", &cover_buffer));
+    // Re-adding the same title replaces its own shortcut.
+    try add(ports.dir, artwork.dir, shortcut, "Halo", "png-bytes");
 
     try ports.dir.writeFile(.{ .sub_path = "Celeste.sh", .data = "#!/bin/bash\n# PortMaster\n" });
+    try ports.dir.writeFile(.{ .sub_path = "Celeste.sh.tmp", .data = "unrelated" });
     try std.testing.expectError(error.NameInUse, add(ports.dir, null, shortcut, "Celeste", null));
-    try std.testing.expectError(error.NotAShortcut, remove(ports.dir, null, "Celeste"));
-    try std.testing.expectEqual(State.foreign, state(ports.dir, "Celeste.sh"));
+    try std.testing.expectError(error.NotAShortcut, remove(ports.dir, null, "Celeste", product));
+    try std.testing.expectEqual(State.foreign, state(ports.dir, "Celeste.sh", product));
+    var tmp_buffer: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("unrelated", try ports.dir.readFile("Celeste.sh.tmp", &tmp_buffer));
 
-    try remove(ports.dir, artwork.dir, "Halo");
-    try std.testing.expectEqual(State.absent, state(ports.dir, "Halo.sh"));
+    try remove(ports.dir, artwork.dir, "Halo", product);
+    try std.testing.expectEqual(State.absent, state(ports.dir, "Halo.sh", product));
     try std.testing.expectError(error.FileNotFound, artwork.dir.access("Halo.png", .{}));
+}
+
+test "a shortcut for another title with the same port name is left alone" {
+    var ports = std.testing.tmpDir(.{});
+    defer ports.cleanup();
+    const first = Shortcut{ .launcher = "/roms/ports/GreenOvercast.sh", .service = .geforce_now, .product_id = "title-a" };
+    var second = first;
+    second.product_id = "title-b";
+
+    // "A/B" and "A:B" both become "A B".
+    try add(ports.dir, null, first, "A B", null);
+    try std.testing.expectEqual(State.foreign, state(ports.dir, "A B.sh", second.product_id));
+    try std.testing.expectError(error.NameInUse, add(ports.dir, null, second, "A B", null));
+    try std.testing.expectError(error.NotAShortcut, remove(ports.dir, null, "A B", second.product_id));
+    try std.testing.expectEqual(State.shortcut, state(ports.dir, "A B.sh", first.product_id));
 }

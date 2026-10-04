@@ -428,9 +428,9 @@ fn togglePortShortcut(ui: *Ui, title: *const library.Title) ?[*:0]const u8 {
 
     var script_buffer: [port_shortcut.name_capacity + 8]u8 = undefined;
     const script_name = std.fmt.bufPrint(&script_buffer, "{s}.sh", .{name}) catch unreachable;
-    switch (port_shortcut.state(ports, script_name)) {
+    switch (port_shortcut.state(ports, script_name, product_id)) {
         .shortcut => {
-            port_shortcut.remove(ports, artwork_dir, name) catch |err| {
+            port_shortcut.remove(ports, artwork_dir, name, product_id) catch |err| {
                 std.debug.print("Port shortcut could not be removed: {s}\n", .{@errorName(err)});
                 return "SHORTCUT COULD NOT BE REMOVED";
             };

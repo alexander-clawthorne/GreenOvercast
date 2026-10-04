@@ -42,6 +42,10 @@ pub const Loader = struct {
 
     /// Converts a title's cached artwork into a PNG sized for port frontends. Returns
     /// null when the artwork has not been cached yet.
+    ///
+    /// Runs on the caller's thread. It is only called when the player adds a shortcut,
+    /// and cached artwork is requested at w=256 (GeForce NOW) or 320x480 (Xbox), so the
+    /// decode, resize and encode are a one-off cost rather than per-frame work.
     pub fn cachedCoverPng(self: *const Loader, allocator: std.mem.Allocator, product_id: []const u8) ?[]u8 {
         if (!settings.validProductId(product_id)) return null;
         var path_buffer: [640]u8 = undefined;
@@ -49,7 +53,8 @@ pub const Loader = struct {
         // Not readFileAlloc: it sizes the buffer with File.stat(), which needs statx and
         // fails on the 4.9 kernels these handhelds ship (see stat_compat.zig).
         const data = readCache(allocator, path) catch |err| {
-            std.debug.print("Shortcut artwork unavailable: {s}\n", .{@errorName(err)});
+            if (err != error.FileNotFound)
+                std.debug.print("Shortcut artwork unavailable: {s}\n", .{@errorName(err)});
             return null;
         };
         defer allocator.free(data);
