@@ -96,7 +96,11 @@ export GREENOVERCAST_SETTINGS_FILE="$settings_file"
 export GREENOVERCAST_ARTWORK_CACHE_DIR="$artwork_cache_dir"
 
 # Game shortcuts are written next to this launcher and run it again with a title id.
-port_launcher=$(realpath "$0") && export GREENOVERCAST_PORT_LAUNCHER="$port_launcher"
+if port_launcher=$(realpath "${BASH_SOURCE[0]:-$0}"); then
+  export GREENOVERCAST_PORT_LAUNCHER="$port_launcher"
+else
+  echo "Game shortcuts disabled: unable to resolve the launcher path." >&2
+fi
 # muOS shows port box art from its catalogue, the same folder PortMaster fills on install.
 for ports_catalogue in "/run/muos/storage/info/catalogue/External - Ports" \
   "/mnt/mmc/MUOS/info/catalogue/External - Ports"; do
