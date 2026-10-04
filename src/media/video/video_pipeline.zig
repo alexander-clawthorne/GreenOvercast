@@ -160,7 +160,12 @@ fn loadBootstrap(pipeline: *Pipeline) c_int {
             std.debug.print("Ignoring unreadable H.264 bootstrap cache: {s}\n", .{@errorName(err)});
         return 0;
     };
-    if (size == 0 or size > bootstrap_capacity) return 0;
+    if (size == 0) return 0;
+    if (size > bootstrap_capacity) {
+        if (debugEnabled())
+            std.debug.print("Ignoring oversized H.264 bootstrap cache (over {d} bytes)\n", .{bootstrap_capacity});
+        return 0;
+    }
     if (c.go_h264_depacketizer_set_bootstrap(pipeline.depacketizer, &data, @intCast(size)) != 0) {
         if (debugEnabled()) std.debug.print("Ignoring invalid H.264 bootstrap cache\n", .{});
         return 0;
