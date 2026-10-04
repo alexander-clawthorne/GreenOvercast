@@ -418,7 +418,10 @@ fn togglePortShortcut(ui: *Ui, title: *const library.Title) ?[*:0]const u8 {
     var ports = std.fs.openDirAbsolute(ports_path, .{}) catch return "PORTS FOLDER NOT FOUND";
     defer ports.close();
     var artwork_dir: ?std.fs.Dir = if (ui.port_artwork_dir) |path|
-        std.fs.openDirAbsolute(path, .{}) catch null
+        std.fs.openDirAbsolute(path, .{}) catch |err| blk: {
+            std.debug.print("Port artwork folder unavailable: {s}\n", .{@errorName(err)});
+            break :blk null;
+        }
     else
         null;
     defer if (artwork_dir) |*directory| directory.close();

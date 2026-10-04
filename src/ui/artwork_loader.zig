@@ -46,10 +46,18 @@ pub const Loader = struct {
         if (!settings.validProductId(product_id)) return null;
         var path_buffer: [640]u8 = undefined;
         const path = cachePath(self, product_id, &path_buffer) orelse return null;
-        const data = std.fs.cwd().readFileAlloc(allocator, path, response_limit) catch return null;
+        // Not readFileAlloc: it sizes the buffer with File.stat(), which needs statx and
+        // fails on the 4.9 kernels these handhelds ship (see stat_compat.zig).
+        const data = readCache(allocator, path) catch |err| {
+            std.debug.print("Shortcut artwork unavailable: {s}\n", .{@errorName(err)});
+            return null;
+        };
         defer allocator.free(data);
         var image = std.mem.zeroes(c.GoArtworkImage);
-        if (c.go_artwork_decode_jpeg(data.ptr, data.len, 1024, 1024, &image) != 0) return null;
+        if (c.go_artwork_decode_jpeg(data.ptr, data.len, 1024, 1024, &image) != 0) {
+            std.debug.print("Shortcut artwork could not be decoded\n", .{});
+            return null;
+        }
         defer c.go_artwork_image_destroy(&image);
         const width: usize = @intCast(image.width);
         const height: usize = @intCast(image.height);
@@ -62,9 +70,20 @@ pub const Loader = struct {
             stride,
             cover_image.box_width,
             cover_image.box_height,
-        ) catch return null;
+        ) catch |err| {
+            std.debug.print("Shortcut artwork could not be resized ({d}x{d}, stride {d}): {s}\n", .{
+                width,
+                height,
+                stride,
+                @errorName(err),
+            });
+            return null;
+        };
         defer fitted.deinit(allocator);
-        return cover_image.encodePng(allocator, fitted) catch null;
+        return cover_image.encodePng(allocator, fitted) catch |err| {
+            std.debug.print("Shortcut artwork could not be encoded: {s}\n", .{@errorName(err)});
+            return null;
+        };
     }
 
     pub fn request(self: *Loader, product_id: []const u8, url: []const u8) void {
@@ -271,6 +290,12 @@ fn cachePath(loader: *const Loader, product_id: []const u8, output: []u8) ?[]con
         "{s}/{s}.jpg",
         .{ loader.cache_dir[0..loader.cache_dir_length], product_id },
     ) catch null;
+}
+
+fn readCache(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    const file = try std.fs.cwd().openFile(path, .{});
+    defer file.close();
+    return file.readToEndAlloc(allocator, response_limit);
 }
 
 fn writeCache(path: []const u8, data: []const u8) void {
