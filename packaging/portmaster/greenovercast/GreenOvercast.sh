@@ -94,6 +94,17 @@ export GREENOVERCAST_H264_BOOTSTRAP_FILE="$video_bootstrap_file"
 export GREENOVERCAST_CATALOG_FILE="$catalog_file"
 export GREENOVERCAST_SETTINGS_FILE="$settings_file"
 export GREENOVERCAST_ARTWORK_CACHE_DIR="$artwork_cache_dir"
+
+# Game shortcuts are written next to this launcher and run it again with a title id.
+port_launcher=$(realpath "$0") && export GREENOVERCAST_PORT_LAUNCHER="$port_launcher"
+# muOS shows port box art from its catalogue, the same folder PortMaster fills on install.
+for ports_catalogue in "/run/muos/storage/info/catalogue/External - Ports" \
+  "/mnt/mmc/MUOS/info/catalogue/External - Ports"; do
+  if [ -d "$ports_catalogue/box" ]; then
+    export GREENOVERCAST_PORT_ARTWORK_DIR="$ports_catalogue/box"
+    break
+  fi
+done
 export GREENOVERCAST_CEDAR_LIBRARY="$GAMEDIR/libgreenovercast-cedar.so"
 export GREENOVERCAST_MPP_LIBRARY="$GAMEDIR/libgreenovercast-mpp.so"
 export LD_LIBRARY_PATH="$GAMEDIR:${LD_LIBRARY_PATH:-}"

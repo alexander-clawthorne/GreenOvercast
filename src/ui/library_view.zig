@@ -110,12 +110,17 @@ pub fn artworkUrl(title: *const Title) []const u8 {
     return bufferString(&title.artwork_url);
 }
 
-pub fn requestedTitle(titles: []const Title, requested: []const u8) usize {
+pub fn findTitle(titles: []const Title, requested: []const u8) ?usize {
+    if (requested.len == 0) return null;
     for (titles, 0..) |*title, index| {
         if (std.mem.eql(u8, bufferString(&title.title_id), requested) or
             std.mem.eql(u8, productId(title), requested)) return index;
     }
-    return 0;
+    return null;
+}
+
+pub fn requestedTitle(titles: []const Title, requested: []const u8) usize {
+    return findTitle(titles, requested) orelse 0;
 }
 
 pub fn matchingCount(
@@ -138,6 +143,8 @@ pub fn draw(
     store: *const settings.Store,
     artwork_pointer: ?*anyopaque,
     provider: provider_badge.Provider,
+    shortcuts: bool,
+    notice: ?[*:0]const u8,
 ) void {
     const renderer: *c.SDL_Renderer = @ptrCast(@alignCast(renderer_pointer));
     const artwork: ?*c.SDL_Texture = if (artwork_pointer) |value| @ptrCast(@alignCast(value)) else null;
@@ -216,9 +223,13 @@ pub fn draw(
         controls.Prompt.two(.left_bumper, .right_bumper, "TAB"),
         controls.Prompt.two(.left_trigger, .right_trigger, "LETTER"),
         controls.Prompt.one(.start, "SETTINGS"),
+        controls.Prompt.one(.select, "PORTS"),
     };
     controls.drawRow(renderer, 16, 431, &primary, style.bright());
-    controls.drawRow(renderer, 16, 455, &secondary, style.accent());
+    if (notice) |message|
+        font.text(renderer, 16, 459, 2, message, style.bright())
+    else
+        controls.drawRow(renderer, 16, 455, secondary[0..if (shortcuts) secondary.len else secondary.len - 1], style.accent());
     c.SDL_RenderPresent(renderer);
 }
 
