@@ -151,10 +151,16 @@ fn loadBootstrap(pipeline: *Pipeline) c_int {
         return 0;
     };
     defer file.close();
-    const size = file.getEndPos() catch return 0;
+    // Size the cache by reading it: getEndPos() goes through File.stat(), which needs
+    // statx and fails on the 4.9 kernels H700 devices ship. One spare byte detects an
+    // oversized file.
+    var data: [bootstrap_capacity + 1]u8 = undefined;
+    const size = file.readAll(&data) catch |err| {
+        if (debugEnabled())
+            std.debug.print("Ignoring unreadable H.264 bootstrap cache: {s}\n", .{@errorName(err)});
+        return 0;
+    };
     if (size == 0 or size > bootstrap_capacity) return 0;
-    var data: [bootstrap_capacity]u8 = undefined;
-    file.reader().readNoEof(data[0..@intCast(size)]) catch return 0;
     if (c.go_h264_depacketizer_set_bootstrap(pipeline.depacketizer, &data, @intCast(size)) != 0) {
         if (debugEnabled()) std.debug.print("Ignoring invalid H.264 bootstrap cache\n", .{});
         return 0;
