@@ -157,15 +157,41 @@ pub fn recordedArtwork(script: []const u8) ?ArtworkRecord {
     return null;
 }
 
-/// Whether the artwork on disk is still exactly the file a shortcut wrote. Reads the file
-/// rather than calling stat(), which needs statx and fails on 4.9 kernels.
-fn artworkMatches(directory: std.fs.Dir, cover_name: []const u8, record: ArtworkRecord) bool {
-    const file = directory.openFile(cover_name, .{}) catch return false;
+/// The artwork's bytes when the file on disk is still exactly what `record` describes, so
+/// add() can restore it if saving the script fails. Reads the file rather than calling
+/// stat(), which needs statx and fails on 4.9 kernels. Free with std.heap.page_allocator.
+fn readOwnedArtwork(directory: std.fs.Dir, cover_name: []const u8, record: ArtworkRecord) ?[]u8 {
+    const file = directory.openFile(cover_name, .{}) catch return null;
     defer file.close();
-    const data = file.readToEndAlloc(std.heap.page_allocator, max_artwork_bytes) catch return false;
-    defer std.heap.page_allocator.free(data);
+    const data = file.readToEndAlloc(std.heap.page_allocator, max_artwork_bytes) catch return null;
     const current = ArtworkRecord.of(data);
-    return current.crc32 == record.crc32 and current.size == record.size;
+    if (current.crc32 == record.crc32 and current.size == record.size) return data;
+    std.heap.page_allocator.free(data);
+    return null;
+}
+
+fn artworkMatches(directory: std.fs.Dir, cover_name: []const u8, record: ArtworkRecord) bool {
+    const data = readOwnedArtwork(directory, cover_name, record) orelse return false;
+    std.heap.page_allocator.free(data);
+    return true;
+}
+
+/// Creates a file that must not exist yet. If another writer creates the name after our
+/// existence check, this fails with error.PathAlreadyExists instead of replacing their file.
+/// Exclusive creation rather than a no-replace rename, which FUSE filesystems such as the
+/// muOS catalogue's do not reliably support. A failed write removes only the file it created.
+fn writeNew(directory: std.fs.Dir, name: []const u8, data: []const u8, mode: std.fs.File.Mode) !void {
+    var file = try directory.createFile(name, .{ .exclusive = true });
+    var complete = false;
+    defer {
+        file.close();
+        if (!complete) directory.deleteFile(name) catch {};
+    }
+    try file.writeAll(data);
+    // The port launcher runs under umask 077; frontends need to read the artwork.
+    try file.chmod(mode);
+    try file.sync();
+    complete = true;
 }
 
 fn artworkExists(directory: std.fs.Dir, cover_name: []const u8) bool {
@@ -186,36 +212,65 @@ pub fn add(
     const existing = inspect(ports, script_name, shortcut.product_id, &existing_buffer);
     if (existing.state == .foreign) return error.NameInUse;
 
-    var owned: ?ArtworkRecord = null;
-    var created_artwork = false;
     var cover_buffer: [name_capacity + 8]u8 = undefined;
     const cover_name = try std.fmt.bufPrint(&cover_buffer, "{s}.png", .{name});
-    if (artwork) |directory| {
-        // Only an image this shortcut wrote, still unchanged on disk, may be replaced, and
-        // its record carries over when no new image is written.
-        if (recordedArtwork(existing.content)) |record| {
-            if (artworkMatches(directory, cover_name, record)) owned = record;
+
+    // Only an image this shortcut wrote, still unchanged on disk, counts as its own. Its
+    // bytes are kept so it can be restored if saving the script fails.
+    var previous: ?ArtworkRecord = null;
+    var previous_bytes: ?[]u8 = null;
+    defer if (previous_bytes) |bytes| std.heap.page_allocator.free(bytes);
+    if (artwork) |directory| if (recordedArtwork(existing.content)) |record| {
+        if (readOwnedArtwork(directory, cover_name, record)) |bytes| {
+            previous = record;
+            previous_bytes = bytes;
         }
-    }
-    if (artwork) |directory| if (cover_png) |png| {
-        const absent = !artworkExists(directory, cover_name);
-        const ours = owned != null;
-        if (absent or ours) {
-            if (writeAtomic(directory, cover_name, png, 0o644)) {
-                owned = ArtworkRecord.of(png);
-                created_artwork = absent;
-            } else |err| std.debug.print("Shortcut artwork could not be saved: {s}\n", .{@errorName(err)});
-        } else std.debug.print("Existing artwork kept: {s}\n", .{cover_name});
     };
 
+    const ArtworkPlan = enum { keep, create, replace };
+    const plan: ArtworkPlan = plan: {
+        const directory = artwork orelse break :plan .keep;
+        if (cover_png == null) break :plan .keep;
+        if (previous != null) break :plan .replace;
+        if (!artworkExists(directory, cover_name)) break :plan .create;
+        std.debug.print("Existing artwork kept: {s}\n", .{cover_name});
+        break :plan .keep;
+    };
+
+    // Build and validate the script before touching any file.
     var content = std.ArrayList(u8).init(std.heap.page_allocator);
     defer content.deinit();
-    writeScript(content.writer(), shortcut, name, owned) catch |err| {
-        if (created_artwork) artwork.?.deleteFile(cover_name) catch {};
-        return err;
-    };
+    try writeScript(content.writer(), shortcut, name, if (plan == .keep) previous else ArtworkRecord.of(cover_png.?));
+
+    var written = plan;
+    switch (plan) {
+        .keep => {},
+        .create => writeNew(artwork.?, cover_name, cover_png.?, 0o644) catch |err| {
+            written = .keep;
+            if (err == error.PathAlreadyExists)
+                std.debug.print("Existing artwork kept: {s}\n", .{cover_name})
+            else
+                std.debug.print("Shortcut artwork could not be saved: {s}\n", .{@errorName(err)});
+        },
+        .replace => writeAtomic(artwork.?, cover_name, cover_png.?, 0o644) catch |err| {
+            written = .keep;
+            std.debug.print("Shortcut artwork could not be saved: {s}\n", .{@errorName(err)});
+        },
+    }
+    // Never record an image that is not on disk: fall back to what the shortcut owned before.
+    if (written != plan) {
+        content.clearRetainingCapacity();
+        try writeScript(content.writer(), shortcut, name, previous);
+    }
+
     writeAtomic(ports, script_name, content.items, 0o755) catch |err| {
-        if (created_artwork) artwork.?.deleteFile(cover_name) catch {};
+        // Roll the artwork back so the existing script and its record stay consistent.
+        switch (written) {
+            .keep => {},
+            .create => artwork.?.deleteFile(cover_name) catch {},
+            .replace => writeAtomic(artwork.?, cover_name, previous_bytes.?, 0o644) catch |restore_err|
+                std.debug.print("Shortcut artwork could not be restored: {s}\n", .{@errorName(restore_err)}),
+        }
         return err;
     };
 }
@@ -229,6 +284,9 @@ pub fn remove(ports: std.fs.Dir, artwork: ?std.fs.Dir, name: []const u8, product
     // Artwork first and best-effort, so the script is removed last and any error reported
     // matches what is still on disk. Only an image this shortcut wrote, unchanged since,
     // is removed; anything else in the shared artwork folder belongs to someone else.
+    // Verifying and deleting are separate steps, as POSIX has no compare-and-delete. That
+    // leaves a short window, but GreenOvercast runs in the foreground on these single-app
+    // handhelds, so nothing else writes the catalogue while a shortcut is being removed.
     if (artwork) |directory| if (recordedArtwork(existing.content)) |record| {
         var cover_buffer: [name_capacity + 8]u8 = undefined;
         const cover_name = try std.fmt.bufPrint(&cover_buffer, "{s}.png", .{name});
@@ -438,6 +496,82 @@ test "artwork replaced after the shortcut saved it is kept" {
     try expectArtwork(artwork.dir, "native-port-art");
     try remove(ports.dir, artwork.dir, "Celeste", celeste.product_id);
     try expectArtwork(artwork.dir, "native-port-art");
+}
+
+fn setMode(directory: std.fs.Dir, mode: std.posix.mode_t) !void {
+    const path = try directory.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(path);
+    try std.posix.fchmodat(std.fs.cwd().fd, path, mode, 0);
+}
+
+fn skipAsRoot() !void {
+    // Root ignores directory permissions, so a read-only Ports folder cannot fail a save.
+    if (std.os.linux.geteuid() == 0) return error.SkipZigTest;
+}
+
+test "invalid input changes no artwork" {
+    var ports = std.testing.tmpDir(.{});
+    defer ports.cleanup();
+    var artwork = std.testing.tmpDir(.{});
+    defer artwork.cleanup();
+    try add(ports.dir, artwork.dir, celeste, "Celeste", "shortcut-art-1");
+
+    var invalid = celeste;
+    invalid.launcher = "relative/GreenOvercast.sh";
+    try std.testing.expectError(error.InvalidLauncher, add(ports.dir, artwork.dir, invalid, "Celeste", "shortcut-art-2"));
+    try expectArtwork(artwork.dir, "shortcut-art-1");
+}
+
+test "a failed script save restores the artwork the shortcut owned" {
+    try skipAsRoot();
+    var ports = std.testing.tmpDir(.{});
+    defer ports.cleanup();
+    var artwork = std.testing.tmpDir(.{});
+    defer artwork.cleanup();
+    try add(ports.dir, artwork.dir, celeste, "Celeste", "shortcut-art-1");
+
+    try setMode(ports.dir, 0o555);
+    const result = add(ports.dir, artwork.dir, celeste, "Celeste", "shortcut-art-2");
+    try setMode(ports.dir, 0o755);
+    try std.testing.expectError(error.AccessDenied, result);
+
+    // The previous script and its record still describe the artwork on disk.
+    try expectArtwork(artwork.dir, "shortcut-art-1");
+    var script_buffer: [script_read_capacity]u8 = undefined;
+    try std.testing.expectEqual(
+        ArtworkRecord.of("shortcut-art-1"),
+        recordedArtwork(try ports.dir.readFile("Celeste.sh", &script_buffer)).?,
+    );
+    try remove(ports.dir, artwork.dir, "Celeste", celeste.product_id);
+    try std.testing.expectError(error.FileNotFound, artwork.dir.access("Celeste.png", .{}));
+}
+
+test "a failed script save removes artwork it just created" {
+    try skipAsRoot();
+    var ports = std.testing.tmpDir(.{});
+    defer ports.cleanup();
+    var artwork = std.testing.tmpDir(.{});
+    defer artwork.cleanup();
+
+    try setMode(ports.dir, 0o555);
+    const result = add(ports.dir, artwork.dir, celeste, "Celeste", "shortcut-art");
+    try setMode(ports.dir, 0o755);
+    try std.testing.expectError(error.AccessDenied, result);
+    try std.testing.expectError(error.FileNotFound, artwork.dir.access("Celeste.png", .{}));
+    try std.testing.expectEqual(State.absent, state(ports.dir, "Celeste.sh", celeste.product_id));
+}
+
+test "new artwork never replaces a file created after the existence check" {
+    var artwork = std.testing.tmpDir(.{});
+    defer artwork.cleanup();
+    // Another writer created the name between artworkExists() and the write.
+    try artwork.dir.writeFile(.{ .sub_path = "Celeste.png", .data = "native-port-art" });
+    try std.testing.expectError(error.PathAlreadyExists, writeNew(artwork.dir, "Celeste.png", "shortcut-art", 0o644));
+    try expectArtwork(artwork.dir, "native-port-art");
+
+    try writeNew(artwork.dir, "Fresh.png", "shortcut-art", 0o644);
+    const stat = try artwork.dir.statFile("Fresh.png");
+    try std.testing.expectEqual(@as(std.fs.File.Mode, 0o644), stat.mode & 0o777);
 }
 
 test "a shortcut for another title with the same port name is left alone" {
