@@ -406,6 +406,17 @@ fn updateArtwork(ui: *Ui, view: *const library.View, state: *ArtworkSelection) ?
     return ui.artwork.textureFor(ui.renderer, product_id);
 }
 
+/// A shortcut path from the environment, or null unless it is a non-empty absolute path.
+/// openDirAbsolute() asserts on anything else, which would end the app in ReleaseSafe.
+fn absoluteEnvPath(name: [:0]const u8) ?[]const u8 {
+    const value = std.posix.getenv(name) orelse return null;
+    if (value.len == 0 or !std.fs.path.isAbsolute(value)) {
+        std.debug.print("Ignoring {s}: not an absolute path\n", .{name});
+        return null;
+    }
+    return value;
+}
+
 /// Adds the title to the Ports folder as its own launcher, or removes the shortcut if it
 /// already exists. Returns the notice to show, or null when shortcuts are unavailable.
 fn togglePortShortcut(ui: *Ui, title: *const library.Title) ?[*:0]const u8 {
@@ -675,9 +686,9 @@ pub export fn go_handheld_ui_create(
     const artwork_cache_path = std.posix.getenv("GREENOVERCAST_ARTWORK_CACHE_DIR");
     ui.artwork.start(if (artwork_cache_path) |path| path else null) catch |err|
         std.debug.print("Artwork loading disabled: {s}\n", .{@errorName(err)});
-    ui.port_launcher = std.posix.getenv("GREENOVERCAST_PORT_LAUNCHER");
-    ui.port_artwork_dir = std.posix.getenv("GREENOVERCAST_PORT_ARTWORK_DIR");
-    ui.autostart = std.posix.getenv("GREENOVERCAST_AUTOSTART") != null;
+    ui.port_launcher = absoluteEnvPath("GREENOVERCAST_PORT_LAUNCHER");
+    ui.port_artwork_dir = absoluteEnvPath("GREENOVERCAST_PORT_ARTWORK_DIR");
+    ui.autostart = if (std.posix.getenv("GREENOVERCAST_AUTOSTART")) |value| std.mem.eql(u8, value, "1") else false;
     c.go_controller_input_set_face_button_mode(
         controller_handle,
         if (stored.face_buttons == .system) c.GO_FACE_BUTTON_MODE_SYSTEM else c.GO_FACE_BUTTON_MODE_SWAPPED,
