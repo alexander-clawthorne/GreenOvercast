@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const settings = @import("persistent_settings.zig");
 
 // Second line of every generated script; only files carrying it are ever replaced or removed.
@@ -202,6 +203,13 @@ fn artworkExists(directory: std.fs.Dir, cover_name: []const u8) bool {
     return true;
 }
 
+/// Test seam, compiled out of other builds: runs after add() writes artwork and before it
+/// saves the script, so tests can see the state a failed save has to roll back.
+var after_artwork_write_for_tests: ?*const fn () void = null;
+
+/// Creates the shortcut, or rewrites it when it already exists for this title. The UI only
+/// adds absent shortcuts (Select on an existing one removes it), but re-adding is handled
+/// too: an image the shortcut owns is replaced, or kept with its record without a new cover.
 pub fn add(
     ports: std.fs.Dir,
     artwork: ?std.fs.Dir,
@@ -260,6 +268,7 @@ pub fn add(
             std.debug.print("Shortcut artwork could not be saved: {s}\n", .{@errorName(err)});
         },
     }
+    if (builtin.is_test) if (after_artwork_write_for_tests) |hook| hook();
     // Never record an image that is not on disk: fall back to what the shortcut owned before.
     if (written != plan) {
         content.clearRetainingCapacity();
@@ -513,9 +522,37 @@ fn setMode(directory: std.fs.Dir, mode: std.posix.mode_t) !void {
     try std.posix.fchmodat(std.fs.cwd().fd, path, mode, 0);
 }
 
+/// Records Celeste.png as add() left it just before saving the script.
+const ArtworkObserver = struct {
+    var directory: std.fs.Dir = undefined;
+    var buffer: [32]u8 = undefined;
+    var length: usize = 0;
+
+    fn start(artwork: std.fs.Dir) void {
+        directory = artwork;
+        length = 0;
+        after_artwork_write_for_tests = observe;
+    }
+
+    fn stop() void {
+        after_artwork_write_for_tests = null;
+    }
+
+    fn observe() void {
+        const data = directory.readFile("Celeste.png", &buffer) catch "";
+        length = data.len;
+    }
+
+    fn seen() []const u8 {
+        return buffer[0..length];
+    }
+};
+
 fn skipAsRoot() !void {
-    // Root ignores directory permissions, so a read-only Ports folder cannot fail a save.
-    if (std.os.linux.geteuid() == 0) return error.SkipZigTest;
+    // Root ignores directory permissions, so a read-only folder cannot fail a write. Host
+    // tests also run on macOS, where only the libc call is valid.
+    const uid = if (builtin.os.tag == .linux) std.os.linux.geteuid() else std.c.geteuid();
+    if (uid == 0) return error.SkipZigTest;
 }
 
 test "invalid input changes no artwork" {
@@ -539,11 +576,15 @@ test "a failed script save restores the artwork the shortcut owned" {
     defer artwork.cleanup();
     try add(ports.dir, artwork.dir, celeste, "Celeste", "shortcut-art-1");
 
+    ArtworkObserver.start(artwork.dir);
+    defer ArtworkObserver.stop();
     try setMode(ports.dir, 0o555);
     const result = add(ports.dir, artwork.dir, celeste, "Celeste", "shortcut-art-2");
     try setMode(ports.dir, 0o755);
     try std.testing.expectError(error.AccessDenied, result);
 
+    // The new image really was written before the save failed, and was then restored.
+    try std.testing.expectEqualStrings("shortcut-art-2", ArtworkObserver.seen());
     // The previous script and its record still describe the artwork on disk.
     try expectArtwork(artwork.dir, "shortcut-art-1");
     var script_buffer: [script_read_capacity]u8 = undefined;
@@ -562,10 +603,14 @@ test "a failed script save removes artwork it just created" {
     var artwork = std.testing.tmpDir(.{});
     defer artwork.cleanup();
 
+    ArtworkObserver.start(artwork.dir);
+    defer ArtworkObserver.stop();
     try setMode(ports.dir, 0o555);
     const result = add(ports.dir, artwork.dir, celeste, "Celeste", "shortcut-art");
     try setMode(ports.dir, 0o755);
     try std.testing.expectError(error.AccessDenied, result);
+    // The image really was created before the save failed, and was then deleted.
+    try std.testing.expectEqualStrings("shortcut-art", ArtworkObserver.seen());
     try std.testing.expectError(error.FileNotFound, artwork.dir.access("Celeste.png", .{}));
     try std.testing.expectEqual(State.absent, state(ports.dir, "Celeste.sh", celeste.product_id));
 }
