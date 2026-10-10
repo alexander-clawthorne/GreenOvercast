@@ -520,6 +520,9 @@ fn pickTitle(ui: *Ui, titles: []const library.Title, requested: []const u8) c_in
                     return c.GO_HANDHELD_UI_PICK_CANCELLED;
                 },
                 c.SDL_CONTROLLER_BUTTON_X => {
+                    // The keyboard consumes Select's release, so a pending press must not
+                    // fire on a later release back in the library.
+                    select_armed = false;
                     const preserve = view.selectedTitleIndex();
                     const result = runSearchKeyboard(ui, &view);
                     if (result < 0) return c.GO_HANDHELD_UI_PICK_CANCELLED;
@@ -554,10 +557,9 @@ fn pickTitle(ui: *Ui, titles: []const library.Title, requested: []const u8) c_in
                 c.SDL_CONTROLLER_BUTTON_BACK => select_armed =
                     c.go_controller_input_button_pressed(ui.controller, c.SDL_CONTROLLER_BUTTON_START) == 0,
                 c.SDL_CONTROLLER_BUTTON_START => {
-                    if (c.go_controller_input_button_pressed(ui.controller, c.SDL_CONTROLLER_BUTTON_BACK) != 0) {
-                        select_armed = false;
+                    select_armed = false;
+                    if (c.go_controller_input_button_pressed(ui.controller, c.SDL_CONTROLLER_BUTTON_BACK) != 0)
                         continue;
-                    }
                     const result = settings_view.run(
                         ui.renderer,
                         ui.controller,
