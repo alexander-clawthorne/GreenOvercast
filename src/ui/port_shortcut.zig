@@ -91,7 +91,10 @@ pub fn writeScript(writer: anytype, shortcut: Shortcut, name: []const u8, artwor
     if (!std.fs.path.isAbsolute(shortcut.launcher) or shortcut.launcher.len > max_launcher_length or
         std.mem.indexOfAny(u8, shortcut.launcher, "'\n\r") != null) return error.InvalidLauncher;
     if (!settings.validProductId(shortcut.product_id)) return error.InvalidProductId;
-    if (name.len == 0 or std.mem.indexOfAny(u8, name, "\n\r") != null) return error.InvalidName;
+    // portName() already guarantees these; checked here too because a ':' could make the
+    // "# <name>" comment imitate the artwork record line.
+    if (name.len == 0 or name.len > name_capacity or std.mem.indexOfAny(u8, name, "\n\r:") != null)
+        return error.InvalidName;
     try writer.writeAll("#!/bin/bash\n" ++ marker ++ "\n");
     try writer.print("# {s}\n", .{name});
     try writer.print("export GREENOVERCAST_SERVICE={s}\n", .{shortcut.service.value()});
@@ -287,13 +290,19 @@ pub fn remove(ports: std.fs.Dir, artwork: ?std.fs.Dir, name: []const u8, product
     // Verifying and deleting are separate steps, as POSIX has no compare-and-delete. That
     // leaves a short window, but GreenOvercast runs in the foreground on these single-app
     // handhelds, so nothing else writes the catalogue while a shortcut is being removed.
+    // If the owned artwork cannot be deleted, the script stays: it is the only record of
+    // that image, and keeping it lets a later attempt clean up instead of leaving an image
+    // nobody owns. A null `artwork` means this system has no artwork folder at all.
     if (artwork) |directory| if (recordedArtwork(existing.content)) |record| {
         var cover_buffer: [name_capacity + 8]u8 = undefined;
         const cover_name = try std.fmt.bufPrint(&cover_buffer, "{s}.png", .{name});
         if (artworkMatches(directory, cover_name, record)) {
             directory.deleteFile(cover_name) catch |err| switch (err) {
                 error.FileNotFound => {},
-                else => std.debug.print("Shortcut artwork could not be removed: {s}\n", .{@errorName(err)}),
+                else => {
+                    std.debug.print("Shortcut artwork could not be removed: {s}\n", .{@errorName(err)});
+                    return err;
+                },
             };
         } else if (artworkExists(directory, cover_name)) {
             std.debug.print("Artwork changed since the shortcut saved it, kept: {s}\n", .{cover_name});
@@ -559,6 +568,36 @@ test "a failed script save removes artwork it just created" {
     try std.testing.expectError(error.AccessDenied, result);
     try std.testing.expectError(error.FileNotFound, artwork.dir.access("Celeste.png", .{}));
     try std.testing.expectEqual(State.absent, state(ports.dir, "Celeste.sh", celeste.product_id));
+}
+
+test "the script is kept while its artwork cannot be removed" {
+    try skipAsRoot();
+    var ports = std.testing.tmpDir(.{});
+    defer ports.cleanup();
+    var artwork = std.testing.tmpDir(.{});
+    defer artwork.cleanup();
+    try add(ports.dir, artwork.dir, celeste, "Celeste", "shortcut-art");
+
+    try setMode(artwork.dir, 0o555);
+    const result = remove(ports.dir, artwork.dir, "Celeste", celeste.product_id);
+    try setMode(artwork.dir, 0o755);
+    try std.testing.expectError(error.AccessDenied, result);
+    // The record survives, so a later attempt still removes the image.
+    try std.testing.expectEqual(State.shortcut, state(ports.dir, "Celeste.sh", celeste.product_id));
+    try expectArtwork(artwork.dir, "shortcut-art");
+
+    try remove(ports.dir, artwork.dir, "Celeste", celeste.product_id);
+    try std.testing.expectError(error.FileNotFound, artwork.dir.access("Celeste.png", .{}));
+    try std.testing.expectEqual(State.absent, state(ports.dir, "Celeste.sh", celeste.product_id));
+}
+
+test "port names that could imitate the artwork record are rejected" {
+    var output = std.ArrayList(u8).init(std.testing.allocator);
+    defer output.deinit();
+    const imitation = "GreenOvercast artwork: crc32=00000000 size=1";
+    try std.testing.expectError(error.InvalidName, writeScript(output.writer(), celeste, imitation, null));
+    try std.testing.expectError(error.InvalidName, writeScript(output.writer(), celeste, "N" ** (name_capacity + 1), null));
+    try writeScript(output.writer(), celeste, "N" ** name_capacity, null);
 }
 
 test "new artwork never replaces a file created after the existence check" {

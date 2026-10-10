@@ -442,6 +442,10 @@ fn togglePortShortcut(ui: *Ui, title: *const library.Title) ?library.Notice {
     const script_name = std.fmt.bufPrint(&script_buffer, "{s}.sh", .{name}) catch unreachable;
     switch (port_shortcut.state(ports, script_name, product_id)) {
         .shortcut => {
+            // remove() treats a missing folder as "no artwork on this system". A configured
+            // folder that cannot be opened may still hold this shortcut's image, so keep the
+            // shortcut and its record until it can be removed properly.
+            if (ui.port_artwork_dir != null and artwork_dir == null) return library.Notice.problem("SHORTCUT COULD NOT BE REMOVED");
             port_shortcut.remove(ports, artwork_dir, name, product_id) catch |err| {
                 std.debug.print("Port shortcut could not be removed: {s}\n", .{@errorName(err)});
                 return library.Notice.problem("SHORTCUT COULD NOT BE REMOVED");
