@@ -418,15 +418,16 @@ fn absoluteEnvPath(name: [:0]const u8) ?[]const u8 {
 }
 
 /// Adds the title to the Ports folder as its own launcher, or removes the shortcut if it
-/// already exists. Returns the notice to show, or null when shortcuts are unavailable.
-fn togglePortShortcut(ui: *Ui, title: *const library.Title) ?[*:0]const u8 {
+/// already exists. Returns the notice to show (problems in red), or null when shortcuts
+/// are unavailable.
+fn togglePortShortcut(ui: *Ui, title: *const library.Title) ?library.Notice {
     const launcher = ui.port_launcher orelse return null;
     const product_id = library.productId(title);
     var name_buffer: [port_shortcut.name_capacity]u8 = undefined;
     const name = port_shortcut.portName(&name_buffer, library.titleName(title));
-    if (name.len == 0 or !persistent.validProductId(product_id)) return "THIS GAME CANNOT BE ADDED TO PORTS";
-    const ports_path = std.fs.path.dirname(launcher) orelse return "PORTS FOLDER NOT FOUND";
-    var ports = std.fs.openDirAbsolute(ports_path, .{}) catch return "PORTS FOLDER NOT FOUND";
+    if (name.len == 0 or !persistent.validProductId(product_id)) return library.Notice.problem("THIS GAME CANNOT BE ADDED TO PORTS");
+    const ports_path = std.fs.path.dirname(launcher) orelse return library.Notice.problem("PORTS FOLDER NOT FOUND");
+    var ports = std.fs.openDirAbsolute(ports_path, .{}) catch return library.Notice.problem("PORTS FOLDER NOT FOUND");
     defer ports.close();
     var artwork_dir: ?std.fs.Dir = if (ui.port_artwork_dir) |path|
         std.fs.openDirAbsolute(path, .{}) catch |err| blk: {
@@ -443,12 +444,12 @@ fn togglePortShortcut(ui: *Ui, title: *const library.Title) ?[*:0]const u8 {
         .shortcut => {
             port_shortcut.remove(ports, artwork_dir, name, product_id) catch |err| {
                 std.debug.print("Port shortcut could not be removed: {s}\n", .{@errorName(err)});
-                return "SHORTCUT COULD NOT BE REMOVED";
+                return library.Notice.problem("SHORTCUT COULD NOT BE REMOVED");
             };
             std.debug.print("Removed port shortcut: {s}\n", .{name});
-            return "REMOVED FROM PORTS";
+            return .{ .text = "REMOVED FROM PORTS" };
         },
-        .foreign => return "A PORT WITH THIS NAME ALREADY EXISTS",
+        .foreign => return library.Notice.problem("A PORT WITH THIS NAME ALREADY EXISTS"),
         .absent => {},
     }
 
@@ -463,15 +464,16 @@ fn togglePortShortcut(ui: *Ui, title: *const library.Title) ?[*:0]const u8 {
         .product_id = product_id,
     }, name, cover) catch |err| {
         std.debug.print("Port shortcut could not be saved: {s}\n", .{@errorName(err)});
-        return "SHORTCUT COULD NOT BE SAVED";
+        return library.Notice.problem("SHORTCUT COULD NOT BE SAVED");
     };
     std.debug.print("Added port shortcut: {s}{s}\n", .{ name, if (cover == null) " (no artwork)" else "" });
-    return "ADDED TO PORTS";
+    return .{ .text = "ADDED TO PORTS" };
 }
 
 fn pickTitle(ui: *Ui, titles: []const library.Title, requested: []const u8) c_int {
     if (titles.len == 0) return c.GO_HANDHELD_UI_PICK_CANCELLED;
     ui.cancelled = false;
+    var shortcut_title_missing = false;
     if (ui.autostart) {
         ui.autostart = false;
         if (library.findTitle(titles, requested)) |title_index| {
@@ -479,6 +481,7 @@ fn pickTitle(ui: *Ui, titles: []const library.Title, requested: []const u8) c_in
             return @intCast(title_index);
         }
         std.debug.print("Shortcut title is not in the library\n", .{});
+        shortcut_title_missing = true;
     }
     const indices = std.heap.c_allocator.alloc(usize, titles.len) catch return c.GO_HANDHELD_UI_PICK_CANCELLED;
     defer std.heap.c_allocator.free(indices);
@@ -492,8 +495,12 @@ fn pickTitle(ui: *Ui, titles: []const library.Title, requested: []const u8) c_in
     var artwork_selection = ArtworkSelection{};
     var artwork_texture: ?*anyopaque = null;
     var select_armed = false;
-    var notice: ?[*:0]const u8 = null;
+    var notice: ?library.Notice = null;
     var notice_until: c.Uint32 = 0;
+    if (shortcut_title_missing) {
+        notice = library.Notice.problem("SHORTCUT GAME NOT FOUND");
+        notice_until = c.SDL_GetTicks() +% 2500;
+    }
     var dirty = true;
 
     while (true) {

@@ -15,6 +15,19 @@ pub const query_capacity = 32;
 
 pub const Title = c.GoCatalogTitle;
 
+/// A short message shown in place of the secondary prompt row. Problems draw in red so the
+/// player notices them.
+pub const Notice = struct {
+    text: [*:0]const u8,
+    kind: Kind = .info,
+
+    pub const Kind = enum { info, problem };
+
+    pub fn problem(text: [*:0]const u8) Notice {
+        return .{ .text = text, .kind = .problem };
+    }
+};
+
 pub const Collection = enum {
     all,
     favorites,
@@ -144,7 +157,7 @@ pub fn draw(
     artwork_pointer: ?*anyopaque,
     provider: provider_badge.Provider,
     shortcuts: bool,
-    notice: ?[*:0]const u8,
+    notice: ?Notice,
 ) void {
     const renderer: *c.SDL_Renderer = @ptrCast(@alignCast(renderer_pointer));
     const artwork: ?*c.SDL_Texture = if (artwork_pointer) |value| @ptrCast(@alignCast(value)) else null;
@@ -227,7 +240,7 @@ pub fn draw(
     };
     controls.drawRow(renderer, 16, 431, &primary, style.bright());
     if (notice) |message|
-        font.text(renderer, 16, 459, 2, message, style.bright())
+        font.text(renderer, 16, 459, 2, message.text, if (message.kind == .problem) style.danger() else style.bright())
     else
         controls.drawRow(renderer, 16, 455, secondary[0..if (shortcuts) secondary.len else secondary.len - 1], style.accent());
     c.SDL_RenderPresent(renderer);
