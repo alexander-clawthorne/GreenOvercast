@@ -2,6 +2,10 @@
 
 umask 077
 
+# Resolve this launcher before PortMaster's helpers run or the directory changes, so a
+# relative invocation such as "bash ./GreenOvercast.sh" still names the real file.
+greenovercast_launcher=$(realpath "${BASH_SOURCE[0]:-$0}" 2>/dev/null) || greenovercast_launcher=
+
 XDG_DATA_HOME=${XDG_DATA_HOME:-$HOME/.local/share}
 XDG_CONFIG_HOME=${XDG_CONFIG_HOME:-$HOME/.config}
 
@@ -96,8 +100,8 @@ export GREENOVERCAST_SETTINGS_FILE="$settings_file"
 export GREENOVERCAST_ARTWORK_CACHE_DIR="$artwork_cache_dir"
 
 # Game shortcuts are written next to this launcher and run it again with a title id.
-if port_launcher=$(realpath "${BASH_SOURCE[0]:-$0}"); then
-  export GREENOVERCAST_PORT_LAUNCHER="$port_launcher"
+if [ -n "$greenovercast_launcher" ] && [ -f "$greenovercast_launcher" ]; then
+  export GREENOVERCAST_PORT_LAUNCHER="$greenovercast_launcher"
 else
   echo "Game shortcuts disabled: unable to resolve the launcher path." >&2
 fi
