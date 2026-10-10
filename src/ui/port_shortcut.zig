@@ -6,10 +6,16 @@ pub const marker = "# GreenOvercast game shortcut";
 pub const name_capacity = 64;
 /// Longest launcher path writeScript accepts; keeps every script within what state() reads.
 pub const max_launcher_length = 512;
+/// Written only when the shortcut created its artwork. Port artwork folders such as muOS's
+/// shared catalogue also hold other ports' images, so artwork is replaced or removed only
+/// when this record exists and still matches the file on disk.
+pub const artwork_prefix = "# GreenOvercast artwork: ";
+const max_artwork_bytes = 4 * 1024 * 1024;
 
 const script_read_capacity = 1024;
 const max_script_length = ("#!/bin/bash\n" ++ marker ++ "\n").len + "# \n".len + name_capacity +
     "export GREENOVERCAST_SERVICE=geforce-now\n".len + "export GREENOVERCAST_AUTOSTART=1\n".len +
+    (artwork_prefix ++ "crc32=00000000 size=\n").len + std.fmt.count("{d}", .{std.math.maxInt(u64)}) +
     "exec /bin/bash '' ''\n".len + max_launcher_length + settings.product_id_capacity;
 comptime {
     std.debug.assert(max_script_length < script_read_capacity);
@@ -38,6 +44,16 @@ pub const State = enum {
     absent,
     shortcut,
     foreign,
+};
+
+/// Identifies the exact artwork file a shortcut wrote.
+pub const ArtworkRecord = struct {
+    crc32: u32,
+    size: u64,
+
+    pub fn of(data: []const u8) ArtworkRecord {
+        return .{ .crc32 = std.hash.Crc32.hash(data), .size = data.len };
+    }
 };
 
 /// Turns a catalog title into a file name every CFW frontend accepts: printable ASCII
@@ -71,7 +87,7 @@ pub fn portName(buffer: *[name_capacity]u8, title: []const u8) []const u8 {
     return buffer[start..length];
 }
 
-pub fn writeScript(writer: anytype, shortcut: Shortcut, name: []const u8) !void {
+pub fn writeScript(writer: anytype, shortcut: Shortcut, name: []const u8, artwork: ?ArtworkRecord) !void {
     if (!std.fs.path.isAbsolute(shortcut.launcher) or shortcut.launcher.len > max_launcher_length or
         std.mem.indexOfAny(u8, shortcut.launcher, "'\n\r") != null) return error.InvalidLauncher;
     if (!settings.validProductId(shortcut.product_id)) return error.InvalidProductId;
@@ -80,29 +96,81 @@ pub fn writeScript(writer: anytype, shortcut: Shortcut, name: []const u8) !void 
     try writer.print("# {s}\n", .{name});
     try writer.print("export GREENOVERCAST_SERVICE={s}\n", .{shortcut.service.value()});
     try writer.writeAll("export GREENOVERCAST_AUTOSTART=1\n");
+    if (artwork) |record|
+        try writer.print(artwork_prefix ++ "crc32={x:0>8} size={d}\n", .{ record.crc32, record.size });
     // exec keeps $0 as the real launcher, which PortMaster's control.txt resolves GAMEDIR from.
     try writer.print("exec /bin/bash '{s}' '{s}'\n", .{ shortcut.launcher, shortcut.product_id });
+}
+
+const Inspection = struct {
+    state: State,
+    content: []const u8 = "",
+};
+
+fn inspect(
+    directory: std.fs.Dir,
+    script_name: []const u8,
+    product_id: []const u8,
+    buffer: *[script_read_capacity]u8,
+) Inspection {
+    const file = directory.openFile(script_name, .{}) catch |err| return switch (err) {
+        error.FileNotFound => .{ .state = .absent },
+        else => .{ .state = .foreign },
+    };
+    defer file.close();
+    const length = file.readAll(buffer) catch return .{ .state = .foreign };
+    if (length == buffer.len) return .{ .state = .foreign };
+    const content = buffer[0..length];
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    _ = lines.next();
+    const second = lines.next() orelse return .{ .state = .foreign };
+    if (!std.mem.eql(u8, second, marker)) return .{ .state = .foreign };
+    var ending_buffer: [settings.product_id_capacity + 8]u8 = undefined;
+    const ending = std.fmt.bufPrint(&ending_buffer, " '{s}'\n", .{product_id}) catch
+        return .{ .state = .foreign };
+    if (!std.mem.endsWith(u8, content, ending)) return .{ .state = .foreign };
+    return .{ .state = .shortcut, .content = content };
 }
 
 /// `.shortcut` only for a generated script that launches this product. Different titles
 /// can share a port name, so a marked script for another product counts as foreign.
 pub fn state(directory: std.fs.Dir, script_name: []const u8, product_id: []const u8) State {
-    const file = directory.openFile(script_name, .{}) catch |err| return switch (err) {
-        error.FileNotFound => .absent,
-        else => .foreign,
-    };
-    defer file.close();
     var buffer: [script_read_capacity]u8 = undefined;
-    const length = file.readAll(&buffer) catch return .foreign;
-    if (length == buffer.len) return .foreign;
-    const content = buffer[0..length];
-    var lines = std.mem.splitScalar(u8, content, '\n');
-    _ = lines.next();
-    const second = lines.next() orelse return .foreign;
-    if (!std.mem.eql(u8, second, marker)) return .foreign;
-    var ending_buffer: [settings.product_id_capacity + 8]u8 = undefined;
-    const ending = std.fmt.bufPrint(&ending_buffer, " '{s}'\n", .{product_id}) catch return .foreign;
-    return if (std.mem.endsWith(u8, content, ending)) .shortcut else .foreign;
+    return inspect(directory, script_name, product_id, &buffer).state;
+}
+
+/// The artwork a generated script recorded as its own, if any.
+pub fn recordedArtwork(script: []const u8) ?ArtworkRecord {
+    var lines = std.mem.splitScalar(u8, script, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, artwork_prefix)) continue;
+        var fields = std.mem.tokenizeScalar(u8, line[artwork_prefix.len..], ' ');
+        const crc_field = fields.next() orelse return null;
+        const size_field = fields.next() orelse return null;
+        if (fields.next() != null or !std.mem.startsWith(u8, crc_field, "crc32=") or
+            !std.mem.startsWith(u8, size_field, "size=")) return null;
+        return .{
+            .crc32 = std.fmt.parseUnsigned(u32, crc_field["crc32=".len..], 16) catch return null,
+            .size = std.fmt.parseUnsigned(u64, size_field["size=".len..], 10) catch return null,
+        };
+    }
+    return null;
+}
+
+/// Whether the artwork on disk is still exactly the file a shortcut wrote. Reads the file
+/// rather than calling stat(), which needs statx and fails on 4.9 kernels.
+fn artworkMatches(directory: std.fs.Dir, cover_name: []const u8, record: ArtworkRecord) bool {
+    const file = directory.openFile(cover_name, .{}) catch return false;
+    defer file.close();
+    const data = file.readToEndAlloc(std.heap.page_allocator, max_artwork_bytes) catch return false;
+    defer std.heap.page_allocator.free(data);
+    const current = ArtworkRecord.of(data);
+    return current.crc32 == record.crc32 and current.size == record.size;
+}
+
+fn artworkExists(directory: std.fs.Dir, cover_name: []const u8) bool {
+    directory.access(cover_name, .{}) catch |err| return err != error.FileNotFound;
+    return true;
 }
 
 pub fn add(
@@ -114,35 +182,65 @@ pub fn add(
 ) !void {
     var script_buffer: [name_capacity + 8]u8 = undefined;
     const script_name = try std.fmt.bufPrint(&script_buffer, "{s}.sh", .{name});
-    if (state(ports, script_name, shortcut.product_id) == .foreign) return error.NameInUse;
+    var existing_buffer: [script_read_capacity]u8 = undefined;
+    const existing = inspect(ports, script_name, shortcut.product_id, &existing_buffer);
+    if (existing.state == .foreign) return error.NameInUse;
+
+    var owned: ?ArtworkRecord = null;
+    var created_artwork = false;
+    var cover_buffer: [name_capacity + 8]u8 = undefined;
+    const cover_name = try std.fmt.bufPrint(&cover_buffer, "{s}.png", .{name});
+    if (artwork) |directory| {
+        // Only an image this shortcut wrote, still unchanged on disk, may be replaced, and
+        // its record carries over when no new image is written.
+        if (recordedArtwork(existing.content)) |record| {
+            if (artworkMatches(directory, cover_name, record)) owned = record;
+        }
+    }
+    if (artwork) |directory| if (cover_png) |png| {
+        const absent = !artworkExists(directory, cover_name);
+        const ours = owned != null;
+        if (absent or ours) {
+            if (writeAtomic(directory, cover_name, png, 0o644)) {
+                owned = ArtworkRecord.of(png);
+                created_artwork = absent;
+            } else |err| std.debug.print("Shortcut artwork could not be saved: {s}\n", .{@errorName(err)});
+        } else std.debug.print("Existing artwork kept: {s}\n", .{cover_name});
+    };
 
     var content = std.ArrayList(u8).init(std.heap.page_allocator);
     defer content.deinit();
-    try writeScript(content.writer(), shortcut, name);
-    try writeAtomic(ports, script_name, content.items, 0o755);
-
-    const directory = artwork orelse return;
-    const png = cover_png orelse return;
-    var cover_buffer: [name_capacity + 8]u8 = undefined;
-    const cover_name = try std.fmt.bufPrint(&cover_buffer, "{s}.png", .{name});
-    writeAtomic(directory, cover_name, png, 0o644) catch |err|
-        std.debug.print("Shortcut artwork could not be saved: {s}\n", .{@errorName(err)});
+    writeScript(content.writer(), shortcut, name, owned) catch |err| {
+        if (created_artwork) artwork.?.deleteFile(cover_name) catch {};
+        return err;
+    };
+    writeAtomic(ports, script_name, content.items, 0o755) catch |err| {
+        if (created_artwork) artwork.?.deleteFile(cover_name) catch {};
+        return err;
+    };
 }
 
 pub fn remove(ports: std.fs.Dir, artwork: ?std.fs.Dir, name: []const u8, product_id: []const u8) !void {
     var script_buffer: [name_capacity + 8]u8 = undefined;
     const script_name = try std.fmt.bufPrint(&script_buffer, "{s}.sh", .{name});
-    if (state(ports, script_name, product_id) != .shortcut) return error.NotAShortcut;
+    var existing_buffer: [script_read_capacity]u8 = undefined;
+    const existing = inspect(ports, script_name, product_id, &existing_buffer);
+    if (existing.state != .shortcut) return error.NotAShortcut;
     // Artwork first and best-effort, so the script is removed last and any error reported
-    // matches what is still on disk.
-    if (artwork) |directory| {
+    // matches what is still on disk. Only an image this shortcut wrote, unchanged since,
+    // is removed; anything else in the shared artwork folder belongs to someone else.
+    if (artwork) |directory| if (recordedArtwork(existing.content)) |record| {
         var cover_buffer: [name_capacity + 8]u8 = undefined;
         const cover_name = try std.fmt.bufPrint(&cover_buffer, "{s}.png", .{name});
-        directory.deleteFile(cover_name) catch |err| switch (err) {
-            error.FileNotFound => {},
-            else => std.debug.print("Shortcut artwork could not be removed: {s}\n", .{@errorName(err)}),
-        };
-    }
+        if (artworkMatches(directory, cover_name, record)) {
+            directory.deleteFile(cover_name) catch |err| switch (err) {
+                error.FileNotFound => {},
+                else => std.debug.print("Shortcut artwork could not be removed: {s}\n", .{@errorName(err)}),
+            };
+        } else if (artworkExists(directory, cover_name)) {
+            std.debug.print("Artwork changed since the shortcut saved it, kept: {s}\n", .{cover_name});
+        }
+    };
     try ports.deleteFile(script_name);
 }
 
@@ -180,7 +278,7 @@ test "shortcut script relaunches the port launcher straight into the title" {
         .launcher = "/mnt/sdcard/ROMS/PORTS/GreenOvercast.sh",
         .service = .geforce_now,
         .product_id = "a1b2-C3",
-    }, "CONTROL");
+    }, "CONTROL", null);
     try std.testing.expectEqualStrings(
         "#!/bin/bash\n" ++ marker ++ "\n# CONTROL\n" ++
             "export GREENOVERCAST_SERVICE=geforce-now\n" ++
@@ -190,19 +288,41 @@ test "shortcut script relaunches the port launcher straight into the title" {
     );
 }
 
+test "shortcut script records the artwork it owns" {
+    var output = std.ArrayList(u8).init(std.testing.allocator);
+    defer output.deinit();
+    const record = ArtworkRecord{ .crc32 = 0x0a1b2c3d, .size = 104952 };
+    try writeScript(output.writer(), .{
+        .launcher = "/mnt/sdcard/ROMS/PORTS/GreenOvercast.sh",
+        .service = .xbox,
+        .product_id = "9NBLGGH4R315",
+    }, "Halo", record);
+    try std.testing.expectEqualStrings(
+        "#!/bin/bash\n" ++ marker ++ "\n# Halo\n" ++
+            "export GREENOVERCAST_SERVICE=xbox\n" ++
+            "export GREENOVERCAST_AUTOSTART=1\n" ++
+            artwork_prefix ++ "crc32=0a1b2c3d size=104952\n" ++
+            "exec /bin/bash '/mnt/sdcard/ROMS/PORTS/GreenOvercast.sh' '9NBLGGH4R315'\n",
+        output.items,
+    );
+    try std.testing.expectEqual(record, recordedArtwork(output.items).?);
+    try std.testing.expectEqual(@as(?ArtworkRecord, null), recordedArtwork("#!/bin/bash\n" ++ marker ++ "\n"));
+    try std.testing.expectEqual(@as(?ArtworkRecord, null), recordedArtwork(artwork_prefix ++ "crc32=zz size=1\n"));
+}
+
 test "shortcut script rejects values that would break shell quoting" {
     var output = std.ArrayList(u8).init(std.testing.allocator);
     defer output.deinit();
     const base = Shortcut{ .launcher = "/roms/ports/GreenOvercast.sh", .service = .xbox, .product_id = "9NBLGGH4R315" };
     var shortcut = base;
     shortcut.launcher = "/roms/ports/it's/GreenOvercast.sh";
-    try std.testing.expectError(error.InvalidLauncher, writeScript(output.writer(), shortcut, "X"));
+    try std.testing.expectError(error.InvalidLauncher, writeScript(output.writer(), shortcut, "X", null));
     shortcut = base;
     shortcut.launcher = "ports/GreenOvercast.sh";
-    try std.testing.expectError(error.InvalidLauncher, writeScript(output.writer(), shortcut, "X"));
+    try std.testing.expectError(error.InvalidLauncher, writeScript(output.writer(), shortcut, "X", null));
     shortcut = base;
     shortcut.product_id = "id' ; rm -rf /";
-    try std.testing.expectError(error.InvalidProductId, writeScript(output.writer(), shortcut, "X"));
+    try std.testing.expectError(error.InvalidProductId, writeScript(output.writer(), shortcut, "X", null));
 }
 
 test "shortcuts are added and removed without touching other ports" {
@@ -240,6 +360,86 @@ test "shortcuts are added and removed without touching other ports" {
     try std.testing.expectError(error.FileNotFound, artwork.dir.access("Halo.png", .{}));
 }
 
+const celeste = Shortcut{ .launcher = "/roms/ports/GreenOvercast.sh", .service = .geforce_now, .product_id = "gfn-celeste" };
+
+fn expectArtwork(directory: std.fs.Dir, expected: []const u8) !void {
+    var buffer: [32]u8 = undefined;
+    try std.testing.expectEqualStrings(expected, try directory.readFile("Celeste.png", &buffer));
+}
+
+test "existing artwork survives a shortcut added without a cover" {
+    // muOS shares one artwork catalogue between the Ports folders on both cards, so a
+    // native Celeste port elsewhere can already own Celeste.png.
+    var ports = std.testing.tmpDir(.{});
+    defer ports.cleanup();
+    var artwork = std.testing.tmpDir(.{});
+    defer artwork.cleanup();
+    try artwork.dir.writeFile(.{ .sub_path = "Celeste.png", .data = "native-port-art" });
+
+    try add(ports.dir, artwork.dir, celeste, "Celeste", null);
+    try expectArtwork(artwork.dir, "native-port-art");
+    try remove(ports.dir, artwork.dir, "Celeste", celeste.product_id);
+    try expectArtwork(artwork.dir, "native-port-art");
+    try std.testing.expectEqual(State.absent, state(ports.dir, "Celeste.sh", celeste.product_id));
+}
+
+test "existing artwork is neither overwritten nor removed by a shortcut with a cover" {
+    var ports = std.testing.tmpDir(.{});
+    defer ports.cleanup();
+    var artwork = std.testing.tmpDir(.{});
+    defer artwork.cleanup();
+    try artwork.dir.writeFile(.{ .sub_path = "Celeste.png", .data = "native-port-art" });
+
+    try add(ports.dir, artwork.dir, celeste, "Celeste", "shortcut-art");
+    try expectArtwork(artwork.dir, "native-port-art");
+    var script_buffer: [script_read_capacity]u8 = undefined;
+    try std.testing.expectEqual(
+        @as(?ArtworkRecord, null),
+        recordedArtwork(try ports.dir.readFile("Celeste.sh", &script_buffer)),
+    );
+    try remove(ports.dir, artwork.dir, "Celeste", celeste.product_id);
+    try expectArtwork(artwork.dir, "native-port-art");
+}
+
+test "a shortcut replaces and removes only the artwork it wrote" {
+    var ports = std.testing.tmpDir(.{});
+    defer ports.cleanup();
+    var artwork = std.testing.tmpDir(.{});
+    defer artwork.cleanup();
+
+    try add(ports.dir, artwork.dir, celeste, "Celeste", "shortcut-art-1");
+    try expectArtwork(artwork.dir, "shortcut-art-1");
+    var script_buffer: [script_read_capacity]u8 = undefined;
+    try std.testing.expectEqual(
+        ArtworkRecord.of("shortcut-art-1"),
+        recordedArtwork(try ports.dir.readFile("Celeste.sh", &script_buffer)).?,
+    );
+
+    // Re-adding replaces the image it owns and records the new one.
+    try add(ports.dir, artwork.dir, celeste, "Celeste", "shortcut-art-2");
+    try expectArtwork(artwork.dir, "shortcut-art-2");
+    // Re-adding without a cached cover keeps that image and its record.
+    try add(ports.dir, artwork.dir, celeste, "Celeste", null);
+    try expectArtwork(artwork.dir, "shortcut-art-2");
+    try remove(ports.dir, artwork.dir, "Celeste", celeste.product_id);
+    try std.testing.expectError(error.FileNotFound, artwork.dir.access("Celeste.png", .{}));
+}
+
+test "artwork replaced after the shortcut saved it is kept" {
+    var ports = std.testing.tmpDir(.{});
+    defer ports.cleanup();
+    var artwork = std.testing.tmpDir(.{});
+    defer artwork.cleanup();
+
+    try add(ports.dir, artwork.dir, celeste, "Celeste", "shortcut-art");
+    // For example, a native Celeste port installed later writes its own image.
+    try artwork.dir.writeFile(.{ .sub_path = "Celeste.png", .data = "native-port-art" });
+    try add(ports.dir, artwork.dir, celeste, "Celeste", "shortcut-art-2");
+    try expectArtwork(artwork.dir, "native-port-art");
+    try remove(ports.dir, artwork.dir, "Celeste", celeste.product_id);
+    try expectArtwork(artwork.dir, "native-port-art");
+}
+
 test "a shortcut for another title with the same port name is left alone" {
     var ports = std.testing.tmpDir(.{});
     defer ports.cleanup();
@@ -258,19 +458,23 @@ test "a shortcut for another title with the same port name is left alone" {
 test "the longest accepted shortcut can still be recognised and removed" {
     var ports = std.testing.tmpDir(.{});
     defer ports.cleanup();
+    var artwork = std.testing.tmpDir(.{});
+    defer artwork.cleanup();
     const launcher = "/" ++ "p" ** (max_launcher_length - 1);
     const product_id = "x" ** (settings.product_id_capacity - 1);
     const name = "N" ** name_capacity;
     const longest = Shortcut{ .launcher = launcher, .service = .geforce_now, .product_id = product_id };
 
-    try add(ports.dir, null, longest, name, null);
+    // With artwork, so the ownership line is part of the longest script.
+    try add(ports.dir, artwork.dir, longest, name, "png");
     try std.testing.expectEqual(State.shortcut, state(ports.dir, name ++ ".sh", product_id));
-    try remove(ports.dir, null, name, product_id);
+    try remove(ports.dir, artwork.dir, name, product_id);
     try std.testing.expectEqual(State.absent, state(ports.dir, name ++ ".sh", product_id));
+    try std.testing.expectError(error.FileNotFound, artwork.dir.access(name ++ ".png", .{}));
 
     var too_long = longest;
     too_long.launcher = launcher ++ "p";
     var output = std.ArrayList(u8).init(std.testing.allocator);
     defer output.deinit();
-    try std.testing.expectError(error.InvalidLauncher, writeScript(output.writer(), too_long, "N"));
+    try std.testing.expectError(error.InvalidLauncher, writeScript(output.writer(), too_long, "N", null));
 }
